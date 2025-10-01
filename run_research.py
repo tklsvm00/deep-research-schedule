@@ -2,8 +2,8 @@
 # 目的:
 # - Deep Research (高品質) を使い、ヘッジファンドPM視点の銘柄分析レポートをMarkdownで出力
 # - 証券コード 6210 から開始し、実行ごとに 1 銘柄ずつ順番に進める
-# - シーケンスは GitHub Actions の GITHUB_RUN_NUMBER を利用（初回=6210, 2回目=6211, ...）
-# - 4回/日の実行はワークフロー(cron)側で設定してください（本スクリプトは「1回の起動=1銘柄」）
+# - 4回/日の実行はワークフロー(cron)側（前回ご案内のYAML）で設定
+# - ※ 400エラー対策として reasoning.summary を削除し、冒頭サマリーはプロンプトで明示
 
 from openai import OpenAI
 from zoneinfo import ZoneInfo
@@ -40,7 +40,6 @@ SYSTEM_MESSAGE = (
     "法令・規制を尊重し、レポート末尾に『本資料は情報提供目的であり投資勧誘ではない』旨のディスクレーマーを含めてください。"
 )
 
-# 会社名はモデル側でコードから特定させる（上場区分や市場名も）
 USER_QUERY = f"""
 以下の『日本の証券コード』に対応する上場企業について、ヘッジファンドPM視点の
 アナリストレポートを作成してください。レポートは **1銘柄のみ** 対象とします。
@@ -52,7 +51,8 @@ USER_QUERY = f"""
 # <企業正式名>（<証券コード>）— ヘッジファンド銘柄レポート
 - 企業名（日本語/英語）、証券コード、上場市場、ティッカー表記（例: TSE:{target_code}）
 - 株価・時価総額・出来高（可能なら最新の営業日ベース）※取得困難時は注釈付きでNA可
-- 参考日付：データ時点・ニュース日付は**YYYY-MM-DD**で明記
+- 参考日付：データ時点・ニュース日付は **YYYY-MM-DD** で明記
+- **冒頭に「エグゼクティブサマリー（5行以内の箇条書き）」を置く**
 
 ## 1. 会社概要
 - 事業セグメント、主要製品/サービス、顧客、地理的内訳、沿革（重要なM&A/再編）
@@ -106,10 +106,10 @@ resp = client.responses.create(
         {"role": "user", "content": [{"type": "input_text", "text": USER_QUERY}]},
     ],
     tools=[{"type": "web_search_preview"}],  # Deep Researchはデータソースが必須
-    reasoning={"summary": "auto"},
+    # ← reasoning={"summary":"auto"} は外しました（未認証Orgだと400）
 )
 
-# ====== 本文と注釈の抽出（冗長防止のため堅めにパース） ======
+# ====== 本文と注釈の抽出 ======
 def extract_text_and_annotations(r):
     try:
         content = r.output[-1].content[0]
@@ -117,27 +117,30 @@ def extract_text_and_annotations(r):
         annotations = getattr(content, "annotations", []) or []
         return text, annotations
     except Exception:
-        # フォールバック（構造が変わった場合）
         try:
             return getattr(r, "output_text", ""), []
         except Exception:
             return "", []
 
+def ann_get(ann, key, default=""):
+    if isinstance(ann, dict):
+        return ann.get(key, default)
+    return getattr(ann, key, default)
+
 report_text, annotations = extract_text_and_annotations(resp)
 
-# 参考文献（URL）の抽出
+# 参考文献（URL）の整形
 def normalize_link(url: str) -> str:
-    # 余計なトラッキング等を簡易除去（最低限）
     return re.sub(r"(\?|\&)(utm_[^=]+|_hsenc|_hsmi)=[^&]+", "", url)
 
 bib_lines = []
 for i, ann in enumerate(annotations, start=1):
-    title = (getattr(ann, "title", "") or "source").strip()
-    url = normalize_link(getattr(ann, "url", "") or "")
+    title = (ann_get(ann, "title") or "source").strip()
+    url = normalize_link(ann_get(ann, "url"))
     if url:
         bib_lines.append(f"{i}. [{title}]({url})")
 
-# 末尾にReferencesとディスクレーマーを付与
+# ディスクレーマー
 disclaimer = (
     "\n\n---\n"
     "**ディスクレーマー**: 本資料は情報提供のみを目的としており、特定の有価証券の売買の勧誘、投資助言、"
