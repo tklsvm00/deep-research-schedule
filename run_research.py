@@ -1,29 +1,27 @@
 # run_research.py
 # 目的:
-# - Deep Research (高品質) を使い、ヘッジファンドPM視点の銘柄分析レポートをMarkdownで出力
-# - 証券コード 6210 から開始し、実行ごとに 1 銘柄ずつ順番に進める
-# - 4回/日の実行はワークフロー(cron)側（前回ご案内のYAML）で設定
-# - ※ 400エラー対策として reasoning.summary を削除し、冒頭サマリーはプロンプトで明示
+# - Deep Research を使い、ヘッジファンドPM視点の銘柄レポートをMarkdown出力
+# - 6210 から毎実行1銘柄ずつ前進（GITHUB_RUN_NUMBER で管理）
+# - o3 が未解放の場合は o4-mini に自動フォールバック
 
 from openai import OpenAI
+import openai  # 例外クラス用
 from zoneinfo import ZoneInfo
 import os, datetime, pathlib, re
 
 # ====== 設定 ======
-MODEL = os.environ.get("DR_MODEL", "o3-deep-research")  # 高品質モード
-BASE_CODE = int(os.environ.get("DR_BASE_CODE", "6210"))  # 開始コード（デフォルト: 6210）
+PRIMARY_MODEL = os.environ.get("DR_MODEL", "o3-deep-research")  # 高品質を試す
+FALLBACK_MODEL = "o4-mini-deep-research"                         # 未認証でも使いやすい
+BASE_CODE = int(os.environ.get("DR_BASE_CODE", "6210"))
 OUTDIR = pathlib.Path(os.environ.get("DR_OUTDIR", "outputs"))
 OUTDIR.mkdir(exist_ok=True)
 
-# GitHub Actionsの連番（なければ 1 とみなす）
 run_no = int(os.environ.get("GITHUB_RUN_NUMBER", "1"))
 target_code = BASE_CODE + (run_no - 1)
 
-# 日本時間タイムスタンプ（レポートの見出しやファイル名に使用）
 now_jst = datetime.datetime.now(ZoneInfo("Asia/Tokyo"))
 ts = now_jst.strftime("%Y%m%d-%H%M")
 
-# 実行スロットの表示（任意：8/12/17/21時実行を識別するためのラベル）
 def slot_label(dt: datetime.datetime) -> str:
     h = dt.hour
     if h < 10: return "Morning-08JST"
@@ -34,80 +32,66 @@ slot = slot_label(now_jst)
 
 # ====== プロンプト ======
 SYSTEM_MESSAGE = (
-    "あなたは機関投資家（ヘッジファンド）のポートフォリオマネージャー兼リサーチ責任者です。"
+    "あなたは機関投資家（ヘッジファンド）のPM兼リサーチ責任者です。"
     "厳密な出典と最新データに基づき、日本語で、Markdown構造のエクイティ・リサーチレポートを作成します。"
     "曖昧な主張は避け、必ず根拠リンク（注釈）を本文に残してください。"
-    "法令・規制を尊重し、レポート末尾に『本資料は情報提供目的であり投資勧誘ではない』旨のディスクレーマーを含めてください。"
+    "法令・規制を尊重し、末尾に投資勧誘ではない旨のディスクレーマーを含めてください。"
 )
 
 USER_QUERY = f"""
 以下の『日本の証券コード』に対応する上場企業について、ヘッジファンドPM視点の
-アナリストレポートを作成してください。レポートは **1銘柄のみ** 対象とします。
+アナリストレポートを作成してください。レポートは **1銘柄のみ** 対象。
 
 - 対象コード: **{target_code}**（東京証券取引所、4桁コード）
 - 生成日時（JST）: {now_jst:%Y-%m-%d %H:%M} ({slot})
 
 ## 出力要件（Markdown）
 # <企業正式名>（<証券コード>）— ヘッジファンド銘柄レポート
-- 企業名（日本語/英語）、証券コード、上場市場、ティッカー表記（例: TSE:{target_code}）
-- 株価・時価総額・出来高（可能なら最新の営業日ベース）※取得困難時は注釈付きでNA可
-- 参考日付：データ時点・ニュース日付は **YYYY-MM-DD** で明記
-- **冒頭に「エグゼクティブサマリー（5行以内の箇条書き）」を置く**
+- 企業名（日/英）、証券コード、上場市場、ティッカー表記（例: TSE:{target_code}）
+- 株価・時価総額・出来高（可能なら最新営業日ベース。難しければ注釈付きでNA）
+- データ/ニュースの**日付は YYYY-MM-DD で明記**
+- **冒頭に5行以内のエグゼクティブサマリー**
 
 ## 1. 会社概要
-- 事業セグメント、主要製品/サービス、顧客、地理的内訳、沿革（重要なM&A/再編）
-- 経営陣（主要人物と役割）、株主構成（主要株主・浮動株の概観）
-
-## 2. 財務サマリー（単位と通貨を明記）
-- 直近3〜5年の売上・営業利益・営業CF・FCF・ROE・ROIC（表形式）
-- 粗利/営業利益率/在庫回転/設備投資 等の主要指標（可能な範囲で）
-- 直近四半期ハイライト（決算短信/補足資料/IRから要点）
-
-## 3. バリュエーション
-- PER / PBR / EV/EBITDA / 配当利回り（可能ならTTMまたはFYベースを明記）
-- 国内/海外 同業比較（ピアのコードや社名を付記）。差異の要因分析
-
-## 4. 戦略・競争優位
-- 中期経営計画や成長ドライバー（新製品/設備投資/地理展開/価格改定）
-- 技術・サプライチェーン・規制面のモート/参入障壁
-
-## 5. 直近ニュース / イベント
-- 重要開示（TDnet）、IRリリース、日経/各社ニュース（**日付+要約+投資インパクト**）
-- カタリスト（決算/ガイダンス/新製品/規制/大型受注 等）
-
-## 6. リスク
-- 需要/価格/為替/サプライ/規制/財務の主要リスクとモニタリング指標
-
-## 7. 投資シナリオ（数値仮定は保守/合理的な範囲で）
-- **Bull / Base / Bear** の3シナリオ（主要前提・売上/利益レンジ、トリガー）
-- シナリオ確度の定性的評価とウォッチ項目
-
-## 8. スタンス（情報目的）
-- スタンス: **Long / Short / Watch** のいずれか（根拠を簡潔に）
-- 想定投資期間: 3〜6ヶ月 / 12ヶ月
-- コンビクション: 1〜5段階（根拠の質と一貫性を明示）
-
-## 9. 参考資料（本文の注釈から自動的に生成）
-- TDnet、EDINET、有価証券報告書、決算短信、会社IR、証券会社レポ要旨、報道 等
+## 2. 財務サマリー（3〜5年推移・四半期要点・主要指標）
+## 3. バリュエーション（PER/PBR/EV/EBITDA/配当、ピア比較）
+## 4. 戦略・競争優位（中計/投資/技術/サプライ/規制）
+## 5. 直近ニュース/イベント（TDnet/IR/報道：日付・要約・投資インパクト）
+## 6. リスク（需要/価格/為替/供給/規制/財務）
+## 7. 投資シナリオ（Bull/Base/Bear：前提・レンジ・トリガー）
+## 8. スタンス（Long/Short/Watch、期間、コンビクション1〜5）
+## 9. 参考資料（本文注釈から自動生成）
 
 ### 重要
-- **会社名・市場名** をコードから正しく同定し、正式表記を使用。
-- 数値は**出典と時点**を記載。取得不可は NA とし、代替理由を注釈に。
-- 機密情報は用いない。Web上の公開情報に限定。
+- コードから正式社名と市場名を同定。数値は出典と時点を明記。公開情報のみ。
 """
 
-# ====== API 呼び出し ======
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
-resp = client.responses.create(
-    model=MODEL,
-    input=[
-        {"role": "developer", "content": [{"type": "input_text", "text": SYSTEM_MESSAGE}]},
-        {"role": "user", "content": [{"type": "input_text", "text": USER_QUERY}]},
-    ],
-    tools=[{"type": "web_search_preview"}],  # Deep Researchはデータソースが必須
-    # ← reasoning={"summary":"auto"} は外しました（未認証Orgだと400）
-)
+def create_response(model_name: str):
+    return client.responses.create(
+        model=model_name,
+        input=[
+            {"role": "developer", "content": [{"type": "input_text", "text": SYSTEM_MESSAGE}]},
+            {"role": "user", "content": [{"type": "input_text", "text": USER_QUERY}]},
+        ],
+        tools=[{"type": "web_search_preview"}],  # Deep Researchはデータソース必須
+        # reasoning は使用しない（未認証Orgだとエラーになる場合がある）
+    )
+
+# まずは PRIMARY_MODEL（例: o3）で試行 → ダメなら o4-mini にフォールバック
+model_used = PRIMARY_MODEL
+try:
+    resp = create_response(PRIMARY_MODEL)
+except (openai.NotFoundError, openai.BadRequestError) as e:
+    msg = str(e).lower()
+    # よくある条件：model_not_found / verify organization / not allowed
+    if "model_not_found" in msg or "verify organization" in msg or "not allowed" in msg:
+        model_used = FALLBACK_MODEL
+        print(f"[WARN] {PRIMARY_MODEL} が使用不可のため {FALLBACK_MODEL} にフォールバックします。詳細: {e}")
+        resp = create_response(FALLBACK_MODEL)
+    else:
+        raise
 
 # ====== 本文と注釈の抽出 ======
 def extract_text_and_annotations(r):
@@ -129,9 +113,9 @@ def ann_get(ann, key, default=""):
 
 report_text, annotations = extract_text_and_annotations(resp)
 
-# 参考文献（URL）の整形
+# 参考文献の整形
 def normalize_link(url: str) -> str:
-    return re.sub(r"(\?|\&)(utm_[^=]+|_hsenc|_hsmi)=[^&]+", "", url)
+    return re.sub(r"(\?|\&)(utm_[^=]+|_hsenc|_hsmi)=[^&]+", "", url or "")
 
 bib_lines = []
 for i, ann in enumerate(annotations, start=1):
@@ -140,20 +124,17 @@ for i, ann in enumerate(annotations, start=1):
     if url:
         bib_lines.append(f"{i}. [{title}]({url})")
 
-# ディスクレーマー
 disclaimer = (
     "\n\n---\n"
-    "**ディスクレーマー**: 本資料は情報提供のみを目的としており、特定の有価証券の売買の勧誘、投資助言、"
-    "または保証を構成するものではありません。投資判断は自己責任で行ってください。"
+    "**ディスクレーマー**: 本資料は情報提供のみを目的としており、特定の有価証券の売買の勧誘、"
+    "投資助言、または保証を構成するものではありません。投資判断は自己責任で行ってください。"
 )
 
 full_md = report_text
 if bib_lines:
     full_md += "\n\n## References\n" + "\n".join(bib_lines)
-full_md += disclaimer
+full_md += disclaimer + f"\n\n*Model used: **{model_used}***"
 
-# ====== 保存 ======
 outfile = OUTDIR / f"equity_report_{target_code}_{ts}.md"
 outfile.write_text(full_md, encoding="utf-8")
-
-print(f"[OK] Saved: {outfile}  (Run #{run_no}, Code {target_code}, JST {now_jst:%Y-%m-%d %H:%M})")
+print(f"[OK] Saved: {outfile}  (Run #{run_no}, Code {target_code}, JST {now_jst:%Y-%m-%d %H:%M}, Model {model_used})")
